@@ -2,7 +2,7 @@
 import json
 import os
 import boto3
-import re  # 正規表現モジュールをインポート
+import re
 from botocore.exceptions import ClientError
 
 
@@ -19,6 +19,9 @@ bedrock_client = None
 
 # モデルID
 MODEL_ID = os.environ.get("MODEL_ID", "us.amazon.nova-lite-v1:0")
+MAX_TOKENS = int(os.environ.get("MAX_TOKENS", "512"))
+TEMPERATURE = float(os.environ.get("TEMPERATURE", "0.7"))
+TOP_P = float(os.environ.get("TOP_P", "0.9"))
 
 def lambda_handler(event, context):
     try:
@@ -29,21 +32,22 @@ def lambda_handler(event, context):
             bedrock_client = boto3.client('bedrock-runtime', region_name=region)
             print(f"Initialized Bedrock client in region: {region}")
         
-        print("Received event:", json.dumps(event))
+        print(f"Received event: {json.dumps(event)}")
         
         # Cognitoで認証されたユーザー情報を取得
         user_info = None
         if 'requestContext' in event and 'authorizer' in event['requestContext']:
             user_info = event['requestContext']['authorizer']['claims']
-            print(f"Authenticated user: {user_info.get('email') or user_info.get('cognito:username')}")
+            user_identifier = user_info.get('email') or user_info.get('cognito:username')
+            print(f"Authenticated user: {user_identifier}")
         
         # リクエストボディの解析
         body = json.loads(event['body'])
         message = body['message']
         conversation_history = body.get('conversationHistory', [])
         
-        print("Processing message:", message)
-        print("Using model:", MODEL_ID)
+        print(f"Processing message: {message}")
+        print(f"Using model: {MODEL_ID}")
         
         # 会話履歴を使用
         messages = conversation_history.copy()
@@ -55,7 +59,6 @@ def lambda_handler(event, context):
         })
         
         # Nova Liteモデル用のリクエストペイロードを構築
-        # 会話履歴を含める
         bedrock_messages = []
         for msg in messages:
             if msg["role"] == "user":
@@ -73,14 +76,15 @@ def lambda_handler(event, context):
         request_payload = {
             "messages": bedrock_messages,
             "inferenceConfig": {
-                "maxTokens": 512,
+                "maxTokens": MAX_TOKENS,
                 "stopSequences": [],
-                "temperature": 0.7,
-                "topP": 0.9
+                "temperature": TEMPERATURE,
+                "topP": TOP_P
             }
         }
         
-        print("Calling Bedrock invoke_model API with payload:", json.dumps(request_payload))
+        # デバッグログを出力
+        print(f"Calling Bedrock invoke_model API with payload: {json.dumps(request_payload)}")
         
         # invoke_model APIを呼び出し
         response = bedrock_client.invoke_model(
@@ -91,10 +95,12 @@ def lambda_handler(event, context):
         
         # レスポンスを解析
         response_body = json.loads(response['body'].read())
-        print("Bedrock response:", json.dumps(response_body, default=str))
+        print(f"Bedrock response: {json.dumps(response_body, default=str)}")
         
         # 応答の検証
-        if not response_body.get('output') or not response_body['output'].get('message') or not response_body['output']['message'].get('content'):
+        if (not response_body.get('output') or 
+            not response_body['output'].get('message') or 
+            not response_body['output']['message'].get('content')):
             raise Exception("No response content from the model")
         
         # アシスタントの応答を取得
@@ -106,24 +112,30 @@ def lambda_handler(event, context):
             "content": assistant_response
         })
         
+        # レスポンスヘッダー
+        headers = {
+            "Content-Type": "application/json",
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Headers": "Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token",
+            "Access-Control-Allow-Methods": "OPTIONS,POST"
+        }
+        
         # 成功レスポンスの返却
         return {
             "statusCode": 200,
-            "headers": {
-                "Content-Type": "application/json",
-                "Access-Control-Allow-Origin": "*",
-                "Access-Control-Allow-Headers": "Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token",
-                "Access-Control-Allow-Methods": "OPTIONS,POST"
-            },
+            "headers": headers,
             "body": json.dumps({
                 "success": True,
                 "response": assistant_response,
-                "conversationHistory": messages
+                "conversationHistory": messages,
+                "modelId": MODEL_ID
             })
         }
         
-    except Exception as error:
-        print("Error:", str(error))
+    except ClientError as e:
+        error_message = f"AWS Client Error: {str(e)}"
+        error_code = e.response.get('Error', {}).get('Code', 'Unknown')
+        print(f"AWS Client Error ({error_code}): {error_message}")
         
         return {
             "statusCode": 500,
@@ -135,6 +147,25 @@ def lambda_handler(event, context):
             },
             "body": json.dumps({
                 "success": False,
-                "error": str(error)
+                "error": error_message,
+                "errorCode": error_code
+            })
+        }
+        
+    except Exception as error:
+        error_message = str(error)
+        print(f"Error: {error_message}")
+        
+        return {
+            "statusCode": 500,
+            "headers": {
+                "Content-Type": "application/json",
+                "Access-Control-Allow-Origin": "*",
+                "Access-Control-Allow-Headers": "Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token",
+                "Access-Control-Allow-Methods": "OPTIONS,POST"
+            },
+            "body": json.dumps({
+                "success": False,
+                "error": error_message
             })
         }
